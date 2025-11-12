@@ -129,6 +129,13 @@
   <ItemGroup>
     <ClInclude Include="dataset.hpp" />
     <ClInclude Include="matrix.hpp" />
+    <ClInclude Include="temp.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

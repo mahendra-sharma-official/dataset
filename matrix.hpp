@@ -1,23 +1,139 @@
-﻿#ifndef MATRIX_HPP
-#define MATRIX_HPP
+﻿#pragma once
 
+#include <iostream>
 #include <vector>
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
-#include <thread>
-#include <future>
 #include <numeric>
 #include <limits>
 #include <random>
 
-namespace MATRIX_CONFIGS {
-    static bool ENABLE_CHECKS = false;
+#include <thread>
+#include <future>
+#include <queue>
+#include <functional>
+#include <condition_variable>
+#include <atomic>
+
+//A simple threadpool class
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t num_threads = std::thread::hardware_concurrency());
+    ~ThreadPool();
+
+    // Enqueue a task
+    template <typename F, typename... Args>
+    auto enqueue(F&& f, Args&&... args)
+        -> std::future<typename std::invoke_result_t<F, Args...>>;
+
+    // Change number of threads dynamically
+    void resize(size_t n);
+
+    size_t size() const { return workers_.size(); }
+
+private:
+    void stop_all();
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex queue_mutex_;
+    std::condition_variable condition_;
+    std::atomic<bool> stop_;
+};
+
+// Global instance
+inline ThreadPool GLOBAL_THREAD_POOL;
+
+// ---------------- Implementation ----------------
+
+inline ThreadPool::ThreadPool(size_t num_threads) : stop_(false) {
+    for (size_t i = 0; i < num_threads; ++i) {
+        workers_.emplace_back([this]() {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    condition_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+                    if (stop_ && tasks_.empty())
+                        return;
+                    task = std::move(tasks_.front());
+                    tasks_.pop();
+                }
+                task();
+            }
+            });
+    }
+}
+
+inline ThreadPool::~ThreadPool() {
+    stop_all();
+}
+
+inline void ThreadPool::stop_all() {
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        stop_ = true;
+    }
+    condition_.notify_all();
+    for (auto& w : workers_)
+        if (w.joinable()) w.join();
+    workers_.clear();
+}
+
+template <typename F, typename... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args)
+-> std::future<typename std::invoke_result_t<F, Args...>> {
+    using return_type = typename std::invoke_result_t<F, Args...>;
+
+    auto task = std::make_shared<std::packaged_task<return_type()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+
+    std::future<return_type> res = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        if (stop_)
+            throw std::runtime_error("enqueue on stopped ThreadPool");
+        tasks_.emplace([task]() { (*task)(); });
+    }
+    condition_.notify_one();
+    return res;
+}
+
+// Resize the pool (stop and recreate with n threads)
+inline void ThreadPool::resize(size_t n) {
+    stop_all();
+    stop_ = false;
+
+    for (size_t i = 0; i < n; ++i) {
+        workers_.emplace_back([this]() {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    condition_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+                    if (stop_ && tasks_.empty())
+                        return;
+                    task = std::move(tasks_.front());
+                    tasks_.pop();
+                }
+                task();
+            }
+            });
+    }
+}
+
+namespace THREAD_CONFIGS {
     static bool ENABLE_MULTITHREADING = false;
     static size_t MULTITHREADING_THRESHOLD = 500;  // Use multithreading (even if enabled) only if range is greater or equal to this
     static size_t NUM_THREADS = 1;
 }
 
+namespace MATRIX_CONFIGS {
+    static bool ENABLE_CHECKS = false;
+}
+
+using namespace THREAD_CONFIGS;
 using namespace MATRIX_CONFIGS;
 
 class Matrix {
@@ -96,6 +212,14 @@ public:
     Matrix sum_colwise() const;
 
     // Utility functions
+    void print(size_t max_rows = 5, size_t max_cols = 5) const {
+        for (size_t i = 0; i < std::min(rows_, max_rows); ++i) {
+            for (size_t j = 0; j < std::min(cols_, max_cols); ++j)
+                std::cout << (*this)(i, j) << "\t";
+            std::cout << "\n";
+        }
+    }
+
     void fill(double value);
     Matrix randomize(double min = 0.0, double max = 1.0);
     void randomize_inplace(double min = 0.0, double max = 1.0);
@@ -113,7 +237,7 @@ public:
 
 // Private helper methods
 inline void Matrix::validate_dimensions(const Matrix& other) const {
-    if (!ENABLE_CHECKS) return;    
+    if (!ENABLE_CHECKS) return;
     if (!(rows_ == other.rows_ && cols_ == other.cols_))
         throw std::invalid_argument("Matrix dimensions not same");
 
@@ -150,7 +274,9 @@ static inline void Matrix::parallel_for(size_t start, size_t end, Func&& func) {
         size_t chunk_end = std::min(chunk_start + chunk_size, end);
         if (chunk_start >= end) break;
 
-        futures.push_back(std::async(std::launch::async, func, chunk_start, chunk_end));
+        futures.push_back(GLOBAL_THREAD_POOL.enqueue([=, &func]() {
+            func(chunk_start, chunk_end);
+            }));
     }
 
     for (auto& f : futures)
@@ -159,11 +285,13 @@ static inline void Matrix::parallel_for(size_t start, size_t end, Func&& func) {
 
 
 inline Matrix::Matrix()
-    : data_(1, 0.0), rows_(1), cols_(1) { }
+    : data_(1, 0.0), rows_(1), cols_(1) {
+}
 
 // Constructors
 inline Matrix::Matrix(size_t rows, size_t cols, double init_val)
-    : data_(rows* cols, init_val), rows_(rows), cols_(cols) { }
+    : data_(rows* cols, init_val), rows_(rows), cols_(cols) {
+}
 
 inline Matrix::Matrix(size_t rows, size_t cols, const std::vector<double>& values)
     : data_(values), rows_(rows), cols_(cols) {
@@ -696,7 +824,7 @@ inline Matrix Matrix::sum_rowwise() const {
             for (size_t i = 0; i < rows_; ++i)
                 result(0, j) += (*this)(i, j);
         }});
-    return result;
+        return result;
 }
 
 inline Matrix Matrix::sum_colwise() const {
@@ -733,7 +861,7 @@ inline Matrix Matrix::randomize(double min, double max)
             result.data_[i] = thread_dist(thread_gen);
         }
         });
-    
+
     return result;
 }
 inline void Matrix::randomize_inplace(double min, double max)
@@ -791,8 +919,5 @@ inline Matrix Matrix::broadcast_to(size_t target_rows, size_t target_cols) const
     return result;
 }
 
-
 inline const std::vector<double>& Matrix::get_data() const { return data_; }
 inline std::vector<double>& Matrix::get_data() { return data_; }
-
-#endif // MATRIX_HPP
